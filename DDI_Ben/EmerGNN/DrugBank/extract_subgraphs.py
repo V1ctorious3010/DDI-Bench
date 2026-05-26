@@ -38,6 +38,7 @@ import time
 import numpy as np
 from scipy import sparse
 from tqdm import tqdm
+import torch
 
 
 # ────────────────────── Config ──────────────────────
@@ -119,54 +120,63 @@ def build_graph_for_split(kg, ddi, scenario, split):
     return triplet_sets
 
 
-# ────────────────────── BFS ──────────────────────
+# ────────────────────── PPR ──────────────────────
 
-def bfs_distances(sp_csr, source, max_depth):
-    """BFS trả về int8 distance array. Unreachable = max_depth+1.
+def build_ppr_adj(triplets_list, n_entities, device="cuda"):
+    rows_all, cols_all = [], []
+    for triplets in triplets_list:
+        if len(triplets) == 0:
+            continue
+        h = triplets[:, 0].astype(np.int64)
+        t = triplets[:, 1].astype(np.int64)
+        mask = h != t
+        rows_all.extend([h[mask], t[mask]])
+        cols_all.extend([t[mask], h[mask]])
+    
+    rows = np.concatenate(rows_all)
+    cols = np.concatenate(cols_all)
 
-    Chi phí: O(reachable_edges) — chỉ duyệt vùng ≤ max_depth hops.
-    """
-    n = sp_csr.shape[0]
-    UNREACH = max_depth + 1
-    dist = np.full(n, UNREACH, dtype=np.int8)
-    dist[source] = 0
-    frontier = np.array([source], dtype=np.int64)
-    for d in range(1, max_depth + 1):
-        if len(frontier) == 0:
-            break
-        # Lấy tất cả neighbor của frontier nodes qua CSR indexing
-        nbrs = sp_csr[frontier].indices
-        if len(nbrs) == 0:
-            break
-        new_mask = dist[nbrs] > d
-        new_nodes = np.unique(nbrs[new_mask])
-        if len(new_nodes) == 0:
-            break
-        dist[new_nodes] = d
-        frontier = new_nodes
-    return dist
+    src = torch.tensor(cols, dtype=torch.long, device=device)
+    dst = torch.tensor(rows, dtype=torch.long, device=device)
+    edges = torch.stack([dst, src])
 
+    deg = torch.zeros(n_entities, device=device)
+    deg.scatter_add_(0, src, torch.ones_like(src, dtype=torch.float))
+    deg_inv = 1.0 / deg.clamp(min=1)
+    norm_values = deg_inv[src]
 
-def extract_tight_subgraph(sp_csr, h, t, L):
-    """Trả về sorted array of node IDs in V_tight(h, t, L).
+    adj = torch.sparse_coo_tensor(
+        edges, norm_values, size=(n_entities, n_entities)
+    ).coalesce()
+    
+    return adj
 
-    V_tight = { j : d(h,j) + d(j,t) ≤ L }
+@torch.no_grad()
+def extract_ppr_subgraph(adj, h, t, n_entities, ppr_k=200, ppr_alpha=0.15, ppr_iters=10, device="cuda"):
+    s_head = torch.zeros((n_entities, 1), device=device)
+    s_head[h, 0] = 1.0
+    p_head = s_head.clone()
 
-    Nếu d(h,t) > L → return empty array (cặp unreachable).
-    """
-    d_h = bfs_distances(sp_csr, h, L)
-    d_t = bfs_distances(sp_csr, t, L)
-    # int8 + int8 → int16 (tránh overflow)
-    tight_mask = (d_h.astype(np.int16) + d_t.astype(np.int16)) <= L
-    nodes = np.where(tight_mask)[0]
-    return nodes  # đã sorted (np.where trả sorted)
+    s_tail = torch.zeros((n_entities, 1), device=device)
+    s_tail[t, 0] = 1.0
+    p_tail = s_tail.clone()
 
+    for _ in range(ppr_iters):
+        p_head = (1 - ppr_alpha) * s_head + ppr_alpha * torch.sparse.mm(adj, p_head)
+        p_tail = (1 - ppr_alpha) * s_tail + ppr_alpha * torch.sparse.mm(adj, p_tail)
+
+    p_joint = (p_head * p_tail).squeeze(1)
+    p_joint[h] = float('inf')
+    p_joint[t] = float('inf')
+
+    k = min(ppr_k, n_entities)
+    _, topk_nodes = torch.topk(p_joint, k)
+
+    return np.sort(topk_nodes.cpu().numpy().astype(np.int64))
 
 # ────────────────────── Main extraction ──────────────────────
 
-def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dtype):
-    """Extract + save tight enclosing subgraphs cho 1 (scenario, split)."""
-
+def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir, dtype):
     pairs = ddi[scenario][split]
     n_pairs = len(pairs)
     if n_pairs == 0:
@@ -175,11 +185,11 @@ def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dty
 
     # Build graph
     triplet_sets = build_graph_for_split(kg, ddi, scenario, split)
-    adj = build_undirected_csr(triplet_sets, n_entities)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    adj = build_ppr_adj(triplet_sets, n_entities, device=device)
 
-    print(f'  {scenario}/{split}: {n_pairs:,} pairs, graph {adj.nnz//2:,} edges')
+    print(f'  {scenario}/{split}: {n_pairs:,} pairs, graph {adj._nnz():,} edges')
 
-    # Allocate ragged arrays
     all_nodes = []
     offsets = [0]
     n_nodes_arr = np.empty(n_pairs, dtype=np.uint16)
@@ -191,11 +201,12 @@ def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dty
     t0 = time.time()
     for i, (h, t, r) in enumerate(tqdm(pairs, desc=f'    {scenario}/{split}', ncols=80)):
         h, t, r = int(h), int(t), int(r)
-        nodes = extract_tight_subgraph(adj, h, t, L)
+        
+        # TRÍCH XUẤT BẰNG PPR
+        nodes = extract_ppr_subgraph(adj, h, t, n_entities, ppr_k=ppr_k, device=device)
         n_sub = len(nodes)
 
-        # Đảm bảo h, t luôn có mặt (kể cả nếu unreachable — để seed embedding)
-        if n_sub == 0:
+        if n_sub <= 2:
             nodes = np.array([h, t], dtype=np.int64)
             n_sub = 2
         else:
@@ -209,30 +220,25 @@ def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dty
         rels[i] = r
 
     elapsed = time.time() - t0
-
-    # Concatenate ragged arrays
     all_nodes_cat = np.concatenate(all_nodes)
     offsets_arr = np.array(offsets, dtype=np.int32)
 
-    # Stats
     usable_sizes = n_nodes_arr[n_nodes_arr > 2]
     med = int(np.median(usable_sizes)) if len(usable_sizes) > 0 else 0
     p90 = int(np.percentile(usable_sizes, 90)) if len(usable_sizes) > 0 else 0
     reach_pct = reachable / n_pairs * 100
 
     print(f'    Done {elapsed:.1f}s | reachable={reachable}/{n_pairs} ({reach_pct:.1f}%)')
-    print(f'    |V_tight|: median={med}, p90={p90}, total_nodes_stored={len(all_nodes_cat):,}')
+    print(f'    |V_ppr|: median={med}, p90={p90}, total_nodes_stored={len(all_nodes_cat):,}')
 
-    # Memory estimation
     node_bytes = all_nodes_cat.nbytes
     overhead_bytes = offsets_arr.nbytes + n_nodes_arr.nbytes + heads.nbytes + tails.nbytes + rels.nbytes
     total_mb = (node_bytes + overhead_bytes) / 1024 / 1024
     print(f'    Memory: nodes={node_bytes/1024/1024:.1f}MB + overhead={overhead_bytes/1024:.1f}KB = {total_mb:.1f}MB')
 
-    # Save
-    out_path = os.path.join(out_dir, f'{scenario}_{split}_L{L}.npz')
+    out_path = os.path.join(out_dir, f'{scenario}_{split}_K{ppr_k}.npz')
     meta = {
-        'L': L,
+        'K': ppr_k,
         'scenario': scenario,
         'split': split,
         'n_entities': n_entities,
@@ -244,25 +250,15 @@ def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dty
     }
 
     if dtype == 'float16':
-        # Encode node IDs as float16 — lossless for integers ≤ 2048,
-        # nhưng DrugBank có n_entities=34124 → float16 mất precision ở vùng cao.
-        # Dùng uint16 an toàn hơn (max 65535 >> 34124).
         print(f'    Note: float16 lossy cho node ID > 2048. Dùng uint16 thay thế.')
 
     np.savez_compressed(
-        out_path,
-        offsets=offsets_arr,
-        nodes=all_nodes_cat,  # uint16
-        heads=heads,          # uint16
-        tails=tails,          # uint16
-        rels=rels,            # uint8
-        n_nodes=n_nodes_arr,  # uint16
-        meta=json.dumps(meta),
+        out_path, offsets=offsets_arr, nodes=all_nodes_cat, heads=heads,
+        tails=tails, rels=rels, n_nodes=n_nodes_arr, meta=json.dumps(meta)
     )
     file_size = os.path.getsize(out_path)
     print(f'    Saved: {out_path} ({file_size/1024/1024:.2f} MB compressed)')
     return meta
-
 
 # ────────────────────── CLI ──────────────────────
 
@@ -289,7 +285,7 @@ Examples:
                         choices=ALL_SCENARIOS, help='Scenarios to process')
     parser.add_argument('--splits', nargs='+', default=ALL_SPLITS,
                         choices=ALL_SPLITS, help='Splits to process')
-    parser.add_argument('--L', type=int, default=3,
+    parser.add_argument('--K', type=int, default=100,
                         help='Max walk length (= EmerGNN args.length)')
     parser.add_argument('--dtype', default='uint16', choices=['uint16', 'int32', 'float16'],
                         help='Storage dtype for node IDs (uint16=2B/node, int32=4B, float16=2B but lossy)')
@@ -301,7 +297,7 @@ Examples:
     os.makedirs(out_dir, exist_ok=True)
 
     print(f'=== Extract Tight Enclosing Subgraphs ===')
-    print(f'L = {args.L}')
+    print(f'K = {args.K}')
     print(f'Scenarios: {args.scenarios}')
     print(f'Splits:    {args.splits}')
     print(f'Dtype:     {args.dtype}')
@@ -319,7 +315,7 @@ Examples:
     all_meta = []
     for sc in args.scenarios:
         for sp in args.splits:
-            meta = extract_scenario_split(kg, ddi, sc, sp, args.L, n_entities, out_dir, args.dtype)
+            meta = extract_scenario_split(kg, ddi, sc, sp, args.K, n_entities, out_dir, args.dtype)
             if meta:
                 all_meta.append(meta)
             print()
@@ -336,8 +332,7 @@ Examples:
               f'{m["median_subgraph_size"]:>10,} {m["p90_subgraph_size"]:>10,}')
 
     total_files = len(all_meta)
-    total_size = sum(os.path.getsize(os.path.join(out_dir, f'{m["scenario"]}_{m["split"]}_L{m["L"]}.npz'))
-                     for m in all_meta)
+    total_size = sum(os.path.getsize(os.path.join(out_dir, f'{m["scenario"]}_{m["split"]}_K{m["K"]}.npz')) for m in all_meta)
     print(f'\n{total_files} files, total {total_size/1024/1024:.1f} MB compressed')
     print(f'Saved to: {out_dir}/')
 
@@ -408,7 +403,7 @@ class SubgraphLoader:
 
     def __repr__(self):
         return (f"SubgraphLoader({self.meta['scenario']}/{self.meta['split']}, "
-                f"L={self.meta['L']}, {self.n_pairs:,} pairs, "
+                f"K={self.meta['K']}, {self.n_pairs:,} pairs, "
                 f"med |V|={self.meta['median_subgraph_size']})")
 
 
