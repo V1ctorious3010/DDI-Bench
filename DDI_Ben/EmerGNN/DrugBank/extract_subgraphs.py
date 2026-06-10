@@ -22,13 +22,17 @@ Output:
     ... (mỗi scenario × split 1 file)
 
 Mỗi .npz chứa:
-    offsets     : int32[N_pairs+1]  — ragged array offset, subgraph_i = nodes[offsets[i]:offsets[i+1]]
-    nodes       : uint16[]          — concatenated node IDs (max 34124 < 65535)
-    heads       : uint16[N_pairs]   — head drug id
-    tails       : uint16[N_pairs]   — tail drug id
-    rels        : uint8[N_pairs]    — relation type (< 86)
-    n_nodes     : uint16[N_pairs]   — |V_tight| for each pair (0 if unreachable)
-    meta        : dict              — {L, scenario, split, n_entities, ...}
+    offsets      : int32[N_pairs+1]  — ragged array offset cho các node, subgraph_i = nodes[offsets[i]:offsets[i+1]]
+    nodes        : uint16[]          — các ID node được nối tiếp nhau (concatenated)
+    heads        : uint16[N_pairs]   — ID thuốc đầu (head drug)
+    tails        : uint16[N_pairs]   — ID thuốc cuối (tail drug)
+    rels         : uint8[N_pairs]    — loại quan hệ DDI cần dự đoán (< 86)
+    n_nodes      : uint16[N_pairs]   — số lượng node trong subgraph
+    edge_offsets : int32[N_pairs+1]  — ragged array offset cho các cạnh, edges_i = edge_heads/tails[edge_offsets[i]:edge_offsets[i+1]]
+    edge_heads   : uint16[]          — danh sách nút đầu của các cạnh thực tế
+    edge_tails   : uint16[]          — danh sách nút cuối của các cạnh thực tế
+    edge_rels    : uint8[]           — danh sách quan hệ thực tế tương ứng với các cạnh
+    meta         : dict              — {L, scenario, split, n_entities, ...}
 """
 
 import os
