@@ -299,6 +299,7 @@ def extract_scenario_split(kg, ddi, scenario, split, L, n_entities, out_dir, dty
         heads=heads,          # uint16
         tails=tails,          # uint16
         rels=rels,            # uint8
+        n_nodes=n_nodes_arr,  # Thêm dòng này
         edge_offsets=edge_offsets_arr,
         edge_heads=edge_heads_arr,
         edge_tails=edge_tails_arr,
