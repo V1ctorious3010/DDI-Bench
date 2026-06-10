@@ -172,6 +172,11 @@ def extract_ppr_subgraph(adj, h, t, n_entities, ppr_k=200, ppr_alpha=0.15, ppr_i
     k = min(ppr_k, n_entities)
     _, topk_nodes = torch.topk(p_joint, k)
 
+    # Filter out nodes with 0 score (meaning they are unreachable from both h and t)
+    # Since we set p_joint[h] = inf and p_joint[t] = inf, they will always be kept.
+    mask = p_joint[topk_nodes] > 0
+    topk_nodes = topk_nodes[mask]
+
     return np.sort(topk_nodes.cpu().numpy().astype(np.int64))
 
 # ────────────────────── Main extraction ──────────────────────
@@ -188,6 +193,14 @@ def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir,
     device = "cuda" if torch.cuda.is_available() else "cpu"
     adj = build_ppr_adj(triplet_sets, n_entities, device=device)
 
+    # Build global adjacency list for extracting induced subgraph edges
+    adj_list = [[] for _ in range(n_entities)]
+    for triplets in triplet_sets:
+        for h_edge, t_edge, r_edge in triplets:
+            h_edge, t_edge, r_edge = int(h_edge), int(t_edge), int(r_edge)
+            if h_edge != t_edge:
+                adj_list[h_edge].append((t_edge, r_edge))
+
     print(f'  {scenario}/{split}: {n_pairs:,} pairs, graph {adj._nnz():,} edges')
 
     all_nodes = []
@@ -197,6 +210,11 @@ def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir,
     tails = np.empty(n_pairs, dtype=np.uint16)
     rels = np.empty(n_pairs, dtype=np.uint8)
     reachable = 0
+
+    all_edge_heads = []
+    all_edge_tails = []
+    all_edge_rels = []
+    edge_offsets = [0]
 
     t0 = time.time()
     for i, (h, t, r) in enumerate(tqdm(pairs, desc=f'    {scenario}/{split}', ncols=80)):
@@ -219,9 +237,32 @@ def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir,
         tails[i] = t
         rels[i] = r
 
+        sub_edges_h = []
+        sub_edges_t = []
+        sub_edges_r = []
+        node_set_lookup = set(nodes)
+        for u in nodes:
+            for v, r_edge in adj_list[u]:
+                if v in node_set_lookup:
+                    if (u == h and v == t) or (u == t and v == h):
+                        continue
+                    sub_edges_h.append(u)
+                    sub_edges_t.append(v)
+                    sub_edges_r.append(r_edge)
+
+        n_edges = len(sub_edges_h)
+        all_edge_heads.extend(sub_edges_h)
+        all_edge_tails.extend(sub_edges_t)
+        all_edge_rels.extend(sub_edges_r)
+        edge_offsets.append(edge_offsets[-1] + n_edges)
+
     elapsed = time.time() - t0
     all_nodes_cat = np.concatenate(all_nodes)
     offsets_arr = np.array(offsets, dtype=np.int32)
+    edge_offsets_arr = np.array(edge_offsets, dtype=np.int32)
+    edge_heads_arr = np.array(all_edge_heads, dtype=np.uint16)
+    edge_tails_arr = np.array(all_edge_tails, dtype=np.uint16)
+    edge_rels_arr = np.array(all_edge_rels, dtype=np.uint8)
 
     usable_sizes = n_nodes_arr[n_nodes_arr > 2]
     med = int(np.median(usable_sizes)) if len(usable_sizes) > 0 else 0
@@ -232,7 +273,7 @@ def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir,
     print(f'    |V_ppr|: median={med}, p90={p90}, total_nodes_stored={len(all_nodes_cat):,}')
 
     node_bytes = all_nodes_cat.nbytes
-    overhead_bytes = offsets_arr.nbytes + n_nodes_arr.nbytes + heads.nbytes + tails.nbytes + rels.nbytes
+    overhead_bytes = offsets_arr.nbytes + n_nodes_arr.nbytes + heads.nbytes + tails.nbytes + rels.nbytes + edge_offsets_arr.nbytes + edge_heads_arr.nbytes + edge_tails_arr.nbytes + edge_rels_arr.nbytes
     total_mb = (node_bytes + overhead_bytes) / 1024 / 1024
     print(f'    Memory: nodes={node_bytes/1024/1024:.1f}MB + overhead={overhead_bytes/1024:.1f}KB = {total_mb:.1f}MB')
 
@@ -253,8 +294,18 @@ def extract_scenario_split(kg, ddi, scenario, split, ppr_k, n_entities, out_dir,
         print(f'    Note: float16 lossy cho node ID > 2048. Dùng uint16 thay thế.')
 
     np.savez_compressed(
-        out_path, offsets=offsets_arr, nodes=all_nodes_cat, heads=heads,
-        tails=tails, rels=rels, n_nodes=n_nodes_arr, meta=json.dumps(meta)
+        out_path, 
+        offsets=offsets_arr, 
+        nodes=all_nodes_cat, 
+        heads=heads,
+        tails=tails, 
+        rels=rels, 
+        n_nodes=n_nodes_arr, 
+        edge_offsets=edge_offsets_arr,
+        edge_heads=edge_heads_arr,
+        edge_tails=edge_tails_arr,
+        edge_rels=edge_rels_arr,
+        meta=json.dumps(meta)
     )
     file_size = os.path.getsize(out_path)
     print(f'    Saved: {out_path} ({file_size/1024/1024:.2f} MB compressed)')
@@ -360,6 +411,10 @@ class SubgraphLoader:
         self.tails = data['tails']          # uint16[N]
         self.rels = data['rels']            # uint8[N]
         self.n_nodes = data['n_nodes']      # uint16[N]
+        self.edge_offsets = data['edge_offsets'] # int32[N+1]
+        self.edge_heads = data['edge_heads']     # uint16[]
+        self.edge_tails = data['edge_tails']     # uint16[]
+        self.edge_rels = data['edge_rels']       # uint8[]
         self.meta = json.loads(str(data['meta']))
         self.n_pairs = len(self.heads)
         self.n_entities = self.meta['n_entities']
@@ -369,6 +424,16 @@ class SubgraphLoader:
         start = self.offsets[pair_idx]
         end = self.offsets[pair_idx + 1]
         return self.nodes[start:end]
+
+    def get_edges(self, pair_idx):
+        """Trả về (heads, tails, rels) của các cạnh thực tế cho pair_idx."""
+        start = self.edge_offsets[pair_idx]
+        end = self.edge_offsets[pair_idx + 1]
+        return (
+            self.edge_heads[start:end],
+            self.edge_tails[start:end],
+            self.edge_rels[start:end]
+        )
 
     def get_pair(self, pair_idx):
         """Trả về (head, tail, rel)."""
